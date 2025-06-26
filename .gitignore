@@ -1,0 +1,127 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+*.iml
+
+# VSCode
+.vscode/
+
+# MacOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+*.swp
+*.swo
+
+# Data and calibration outputs
+*.npz
+*.json
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+*.csv
+*.pcd
+
+# Ignore calibration results and test outputs
+GMIND_Calibration.json
+extrinsics_result.json
+
+# Ignore binaries and conda environments
+GMIND/bin/
+GMIND/conda-meta/
+GMIND/lib/
+GMIND/include/
+GMIND/share/
+GMIND/ssl/
+GMIND/x86_64-conda-*/
+
+# Ignore random scripts outputs
+RandomScripts/*.pyc
+RandomScripts/__pycache__/
+
+# Ignore build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.pyd
+*.a
+*.lib
+*.exp
+*.manifest
+*.spec
+
+# Ignore calibration images and outputs
+calibration_file.txt
+RGBA_Image.png
+
+# Ignore requirements lock files
+poetry.lock
+Pipfile.lock
+
+# Ignore user-specific files
+*.user
+*.sublime-workspace
+*.sublime-project
+
+# Ignore logs and temp
+*.log
+*.tmp
+
+# Ignore test outputs
+*.out
+*.test
