@@ -527,6 +527,7 @@ class CalibrationToolbox(QMainWindow):
         self.point_list.clear()
         self.collected_image_points.clear()
         self.collected_lidar_points.clear()
+        self.last_projected_3d_points = None  # Clear projected 3D points as well
         self.status_label.setText('All points cleared.')
         self.log('All points cleared.')
 
@@ -541,13 +542,15 @@ class CalibrationToolbox(QMainWindow):
         QApplication.processEvents()
         return dlg
 
-    def save_extrinsics_to_json(self, rvec, tvec, mean_error, filename="extrinsics_result.json"):
+    def save_extrinsics_to_json(self, rvec, tvec, mean_error, rotation_matrix=None, filename="extrinsics_result.json"):
         # Save extrinsics and error to a JSON file in the current working directory
         extrinsics = {
             "rvec": rvec.flatten().tolist(),
             "tvec": tvec.flatten().tolist(),
             "mean_reprojection_error": float(mean_error)
         }
+        if rotation_matrix is not None:
+            extrinsics["rotation_matrix"] = rotation_matrix.tolist()
         try:
             with open(filename, "w") as f:
                 json.dump(extrinsics, f, indent=2)
@@ -589,7 +592,12 @@ class CalibrationToolbox(QMainWindow):
             self.log(f'Mean reprojection error: {result["mean_error"]:.2f} px')
             self.log(f'Per-point errors: {result["errors"]}')
             # Automatically save extrinsics to JSON
-            self.save_extrinsics_to_json(result["rvec"], result["tvec"], result["mean_error"])
+            self.save_extrinsics_to_json(
+                result["rvec"],
+                result["tvec"],
+                result["mean_error"],
+                result.get("rotation_matrix", None)
+            )
             # --- Store projected 3D->2D points for persistent overlay ---
             try:
                 proj_2d = calibration_runner.project_points(np.asarray(lidar_points, dtype=np.float32), result["rvec"], result["tvec"], camera_matrix, dist_coeffs)
@@ -1005,6 +1013,9 @@ class CalibrationToolbox(QMainWindow):
                     int_ptp = np.ptp(intensities) if len(intensities) > 0 else 1.0
                     norm_int = (intensities - int_min) / (int_ptp + 1e-6)
                     for pt, inten in zip(proj_2d, norm_int):
+                        # Skip points with NaN or inf
+                        if not np.isfinite(pt[0]) or not np.isfinite(pt[1]):
+                            continue
                         x_proj = int(pt[0] * zoom - x_off)
                         y_proj = int(pt[1] * zoom - y_off)
                         if 0 <= x_proj < disp_w and 0 <= y_proj < disp_h:
@@ -1015,6 +1026,9 @@ class CalibrationToolbox(QMainWindow):
                     # No intensities: use light yellow for all points
                     light_yellow = (0, 255, 255)  # BGR
                     for pt in proj_2d:
+                        # Skip points with NaN or inf
+                        if not np.isfinite(pt[0]) or not np.isfinite(pt[1]):
+                            continue
                         x_proj = int(pt[0] * zoom - x_off)
                         y_proj = int(pt[1] * zoom - y_off)
                         if 0 <= x_proj < disp_w and 0 <= y_proj < disp_h:

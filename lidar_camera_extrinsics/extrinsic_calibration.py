@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 from scipy.optimize import minimize, least_squares
+import logging
 
 def project_3d_to_2d(LIDAR_3D_PTS, camera_matrix_input, dist_coeffs_input, rvec, tvec):
     rvec = np.asarray(rvec, dtype=np.float32)
@@ -32,21 +33,27 @@ def run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs):
     lidar_points = np.asarray(lidar_points, dtype=np.float32)
     n = len(image_points)
     if n < 4 or len(lidar_points) < 4:
+        logging.error('Need at least 4 point pairs.')
         return None, 'Need at least 4 point pairs.'
     # Choose solvePnP method based on number of points
     if n == 4:
         method = cv2.SOLVEPNP_P3P
-    elif n == 5:
-        method = cv2.SOLVEPNP_AP3P
     else:
         method = cv2.SOLVEPNP_ITERATIVE
     try:
+        logging.info(f'Calling cv2.solvePnP with {n} points and method {method}')
         success, rvec, tvec = cv2.solvePnP(lidar_points, image_points, camera_matrix, dist_coeffs, flags=method)
     except Exception as e:
+        logging.error(f'cv2.solvePnP failed: {e}')
         return None, f'cv2.solvePnP failed: {e}'
     if not success:
+        logging.error('cv2.solvePnP failed.')
         return None, 'cv2.solvePnP failed.'
+    logging.info(f'solvePnP success: {success}, rvec: {rvec.ravel()}, tvec: {tvec.ravel()}')
     initial_params = np.concatenate([rvec.flatten(), tvec.flatten()])
+    initial_proj_2d = project_3d_to_2d(lidar_points, camera_matrix, dist_coeffs, rvec, tvec)
+    initial_errors = np.linalg.norm(image_points - initial_proj_2d, axis=1)
+    logging.info(f'Initial mean reprojection error: {np.mean(initial_errors):.4f}, max error: {np.max(initial_errors):.4f}')
     result = minimize(
         robust_objective_function,
         initial_params,
@@ -55,19 +62,38 @@ def run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs):
         options={'ftol': 1e-9, 'maxiter': 10000, 'disp': False}
     )
     if not result.success:
-        return None, 'Optimization failed.'
+        logging.warning(f'Optimisation failed: {result.message}. Returning initial pose from solvePnP.')
+        # Fallback: return initial pose from solvePnP
+        proj_2d = initial_proj_2d
+        errors = initial_errors
+        rot_matrix, _ = cv2.Rodrigues(rvec)
+        return {
+            'rvec': rvec,
+            'rotation_matrix': rot_matrix,
+            'tvec': tvec,
+            'proj_2d': proj_2d,
+            'errors': errors,
+            'mean_error': np.mean(errors),
+            'success': False,
+            'fallback': True,
+            'message': f'Optimisation failed: {result.message}'
+        }, 'Optimisation failed, returned initial pose from solvePnP.'
     opt_params = result.x
     rvec_opt = opt_params[:3].reshape(3, 1)
     tvec_opt = opt_params[3:].reshape(3, 1)
     proj_2d = project_3d_to_2d(lidar_points, camera_matrix, dist_coeffs, rvec_opt, tvec_opt)
     errors = np.linalg.norm(image_points - proj_2d, axis=1)
+    rot_matrix_opt, _ = cv2.Rodrigues(rvec_opt)
+    logging.info(f'Optimized mean reprojection error: {np.mean(errors):.4f}, max error: {np.max(errors):.4f}')
     return {
         'rvec': rvec_opt,
+        'rotation_matrix': rot_matrix_opt,
         'tvec': tvec_opt,
         'proj_2d': proj_2d,
         'errors': errors,
         'mean_error': np.mean(errors),
-        'success': True
+        'success': True,
+        'fallback': False
     }, None
 
 def analyze_outliers(image_points, lidar_points, camera_matrix, dist_coeffs):
@@ -192,5 +218,7 @@ def run_bundle_adjustment(image_points_list, lidar_points_list, camera_matrix, d
     if not result.success:
         return None, 'Bundle adjustment failed.'
     rvec_opt = result.x[:3].reshape(3,1)
+    tvec_opt = result.x[3:].reshape(3,1)
+    return {'rvec': rvec_opt, 'tvec': tvec_opt, 'success': True}, None
     tvec_opt = result.x[3:].reshape(3,1)
     return {'rvec': rvec_opt, 'tvec': tvec_opt, 'success': True}, None
