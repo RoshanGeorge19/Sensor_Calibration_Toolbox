@@ -1,3 +1,20 @@
+"""
+LIDAR-Camera Calibration Tool
+--------------------------------------------------
+Interactive LiDAR-camera calibration tool for associating 2D image points with 3D LiDAR points, running robust extrinsic calibration, and visualising results.
+
+Author: Roshan George, Dara Molloy
+Date: 30-06-2025
+Licence: MIT
+
+Features:
+ - Interactive point selection and pairing
+ - Robust calibration (RANSAC, bundle adjustment)
+ - Intrinsics/extrinsics import/export
+ - Undo/redo, reset, and advanced diagnostics
+ - PCD projection visualisation
+--------------------------------------------------
+"""
 import sys
 import numpy as np
 import cv2
@@ -9,36 +26,40 @@ import json
 import os
 
 class CalibrationToolbox(QMainWindow):
-    # Camera intrinsics for flir8.9 (OpenCV standard fields, no skew/fisheye)
+    # Default camera intrinsics for FLIR 8.9mm (OpenCV standard fields, no skew/fisheye)
     CAMERA_INTRINSICS = {
-        "fx": 1823.2131641887504,
-        "fy": 1820.6052667772403,
-        "cx": 2066.627144354761,
-        "cy": 1134.983254011596,
+        "fx": 1823.2131641887504,  # Focal length in x
+        "fy": 1820.6052667772403,  # Focal length in y
+        "cx": 2066.627144354761,   # Principal point x
+        "cy": 1134.983254011596,   # Principal point y
         "model": "standard",
         "dist": [
-            -0.11493534187041937,  # k1
-            0.07868437224005516,   # k2
-            0.0005806697561345654, # p1
-            0.0006835092446758971, # p2
-            -0.01980248809606338,  # k3
-            0.0, 0.0, 0.0,         # k4, k5, k6
-            0.0, 0.0, 0.0, 0.0     # s1, s2, s3, s4
+            -0.11493534187041937,  # k1 (radial distortion)
+            0.07868437224005516,   # k2 (radial distortion)
+            0.0005806697561345654, # p1 (tangential distortion)
+            0.0006835092446758971, # p2 (tangential distortion)
+            -0.01980248809606338,  # k3 (radial distortion)
+            0.0, 0.0, 0.0,         # k4, k5, k6 (higher-order radial)
+            0.0, 0.0, 0.0, 0.0     # s1, s2, s3, s4 (thin prism)
         ]
     }
 
     def __init__(self):
+        """
+        Initialize the main calibration toolbox window and state.
+        """
         super().__init__()
-        self.setWindowTitle('GMIND Sensor Calibration Toolbox (PyQt)')
+        self.setWindowTitle('LIDAR-Camera Calibration Tool')
         self.setGeometry(100, 100, 1400, 900)
         self.initUI()
-        self.true_original_image = None
-        self.collected_image_points = []
-        self.collected_lidar_points = []
-        self.temp_clicked_2d_point = None
-        self.zoom = 1.0
-        self.pan_offset = QPoint(0, 0)
-        self.last_pan_point = None
+        # State variables
+        self.true_original_image = None  # Original loaded image (numpy array)
+        self.collected_image_points = []  # List of 2D image points
+        self.collected_lidar_points = []  # List of 3D lidar points
+        self.temp_clicked_2d_point = None  # Temporary 2D point (before pairing)
+        self.zoom = 1.0  # Current zoom factor
+        self.pan_offset = QPoint(0, 0)  # Current pan offset
+        self.last_pan_point = None  # Last pan anchor point
         # Undo/redo stacks for point management
         self.undo_stack = []
         self.redo_stack = []
@@ -46,7 +67,9 @@ class CalibrationToolbox(QMainWindow):
         self.last_projected_3d_points = None
 
     def push_undo_state(self):
-        # Save a deep copy of the current state for undo
+        """
+        Save a deep copy of the current state for undo functionality.
+        """
         import copy
         state = (
             copy.deepcopy(self.collected_image_points),
@@ -58,6 +81,9 @@ class CalibrationToolbox(QMainWindow):
         self.redo_stack.clear()
 
     def pop_undo_state(self, to_redo=True):
+        """
+        Undo the last action, optionally saving the current state for redo.
+        """
         if not self.undo_stack:
             return
         import copy
@@ -78,6 +104,9 @@ class CalibrationToolbox(QMainWindow):
         self.log('Undo performed.')
 
     def pop_redo_state(self):
+        """
+        Redo the last undone action.
+        """
         if not self.redo_stack:
             return
         import copy
@@ -161,15 +190,22 @@ class CalibrationToolbox(QMainWindow):
         self.remove_point_btn.clicked.connect(self.remove_selected_point)
         control_layout.addWidget(self.remove_point_btn)
 
-        self.clear_points_btn = QPushButton('Clear All Points')
-        self.clear_points_btn.clicked.connect(self.clear_all_points)
-        control_layout.addWidget(self.clear_points_btn)
+
+        self.status_label = QLabel('Status: Ready')
+        control_layout.addWidget(self.status_label)
+
+        control_layout.addStretch()
+
 
         self.run_calib_btn = QPushButton('Run Calibration')
         self.run_calib_btn.clicked.connect(self.run_calibration)
         # Highlight the button: larger, bold, colored
         self.run_calib_btn.setStyleSheet('background-color: #ffcc00; color: #222; font-weight: bold; font-size: 18px; border: 2px solid #bba500; padding: 8px;')
         control_layout.addWidget(self.run_calib_btn)
+
+        self.reset_btn = QPushButton('Reset')
+        self.reset_btn.clicked.connect(self.reset_toolbox)
+        control_layout.addWidget(self.reset_btn)
 
         self.export_btn = QPushButton('Export Points')
         self.export_btn.clicked.connect(self.export_points)
@@ -179,10 +215,6 @@ class CalibrationToolbox(QMainWindow):
         self.import_btn.clicked.connect(self.import_points)
         control_layout.addWidget(self.import_btn)
 
-        self.status_label = QLabel('Status: Ready')
-        control_layout.addWidget(self.status_label)
-
-        control_layout.addStretch()
 
         # Intrinsics tab
         intr_tab = QWidget()
@@ -233,17 +265,15 @@ class CalibrationToolbox(QMainWindow):
         self.save_intr_btn.clicked.connect(self.save_intrinsics_to_file)
 
         # Add advanced calibration/diagnostic buttons
-        self.outlier_btn = QPushButton('Analyze Outliers')
-        self.outlier_btn.clicked.connect(self.analyze_outliers)
+        self.outlier_btn = QPushButton('Analyse Outliers')
+        self.outlier_btn.clicked.connect(self.analyse_outliers)
         control_layout.addWidget(self.outlier_btn)
 
         self.contribution_btn = QPushButton('Point Contribution')
-        self.contribution_btn.clicked.connect(self.analyze_point_contributions)
+        self.contribution_btn.clicked.connect(self.analyse_point_contributions)
         control_layout.addWidget(self.contribution_btn)
 
-        self.visualize_proj_btn = QPushButton('Visualize Projections')
-        self.visualize_proj_btn.clicked.connect(self.visualize_projections)
-        control_layout.addWidget(self.visualize_proj_btn)
+        # Removed Visualize Projections button
 
         # Menu bar
         menubar = self.menuBar()
@@ -251,7 +281,7 @@ class CalibrationToolbox(QMainWindow):
         # Keyboard shortcuts
         self.add_point_btn.setShortcut('Ctrl+N')
         self.remove_point_btn.setShortcut('Delete')
-        self.clear_points_btn.setShortcut('Ctrl+Shift+C')
+        self.reset_btn.setShortcut('Ctrl+Shift+C')
         self.run_calib_btn.setShortcut('Ctrl+R')
         self.export_btn.setShortcut('Ctrl+E')
         self.import_btn.setShortcut('Ctrl+I')
@@ -265,14 +295,7 @@ class CalibrationToolbox(QMainWindow):
         redo_action.triggered.connect(self.redo_action)
         menubar.addAction(redo_action)
 
-        # Robust Calibration and Bundle Adjustment buttons
-        self.robust_calib_btn = QPushButton('Robust Calibration (RANSAC)')
-        self.robust_calib_btn.clicked.connect(self.run_robust_calibration)
-        control_layout.addWidget(self.robust_calib_btn)
-
-        self.bundle_adjust_btn = QPushButton('Bundle Adjustment')
-        self.bundle_adjust_btn.clicked.connect(self.run_bundle_adjustment)
-        control_layout.addWidget(self.bundle_adjust_btn)
+        # Removed Robust Calibration and Bundle Adjustment buttons
 
         # --- Move PCD validation controls to Calibration tab ---
         self.load_pcd_btn = QPushButton('Load PCD')
@@ -286,6 +309,9 @@ class CalibrationToolbox(QMainWindow):
         # Remove Validation tab (do not add it)
 
     def log(self, msg):
+        """
+        Append a message to the log output.
+        """
         self.log_text.append(msg)
 
     def fit_image_to_canvas(self):
@@ -516,20 +542,31 @@ class CalibrationToolbox(QMainWindow):
             self.point_list.takeItem(row)
             del self.collected_image_points[row]
             del self.collected_lidar_points[row]
-            self.status_label.setText('Selected point removed.')
-            self.log('Selected point removed.')
-        else:
-            self.status_label.setText('No point selected.')
+        self.status_label.setText('Selected point removed.')
+        self.log('Selected point removed.')
+        return
+    # If no point selected
+        self.status_label.setText('No point selected.')
 
-    def clear_all_points(self):
-        if self.collected_image_points or self.collected_lidar_points:
-            self.push_undo_state()
-        self.point_list.clear()
+
+    def reset_toolbox(self):
+        # Remove all points, image, overlays, undo/redo, and reset UI
         self.collected_image_points.clear()
         self.collected_lidar_points.clear()
-        self.last_projected_3d_points = None  # Clear projected 3D points as well
-        self.status_label.setText('All points cleared.')
-        self.log('All points cleared.')
+        self.point_list.clear()
+        self.temp_clicked_2d_point = None
+        self.last_projected_3d_points = None
+        self.true_original_image = None
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.loaded_pcd_points = None
+        self.loaded_pcd_intensities = None
+        self.last_extrinsics = None
+        self.image_label.clear()
+        self.status_label.setText('Toolbox reset.')
+        self.log('Toolbox reset: all points, image, overlays, and state cleared.')
+        # Optionally clear log
+        self.log_text.clear()
 
     def show_progress(self, label_text="Working..."):
         dlg = QProgressDialog(label_text, None, 0, 0, self)
@@ -542,16 +579,15 @@ class CalibrationToolbox(QMainWindow):
         QApplication.processEvents()
         return dlg
 
-    def save_extrinsics_to_json(self, rvec, tvec, mean_error, rotation_matrix=None, filename="extrinsics_result.json"):
+    def save_extrinsics_to_json(self, rvec, tvec, mean_error, filename="extrinsics_result.json"):
         # Save extrinsics and error to a JSON file in the current working directory
-        extrinsics = {
-            "rvec": rvec.flatten().tolist(),
-            "tvec": tvec.flatten().tolist(),
-            "mean_reprojection_error": float(mean_error)
-        }
-        if rotation_matrix is not None:
-            extrinsics["rotation_matrix"] = rotation_matrix.tolist()
         try:
+            rot_matrix, _ = cv2.Rodrigues(rvec)
+            extrinsics = {
+                "rotation_matrix": rot_matrix.tolist(),
+                "tvec": tvec.flatten().tolist(),
+                "mean_reprojection_error": float(mean_error)
+            }
             with open(filename, "w") as f:
                 json.dump(extrinsics, f, indent=2)
             self.log(f"Extrinsics saved to {os.path.abspath(filename)}")
@@ -569,43 +605,94 @@ class CalibrationToolbox(QMainWindow):
         dist_coeffs = dist.reshape(-1, 1)
         image_points = self.collected_image_points
         lidar_points = self.collected_lidar_points
-        if len(image_points) < 4 or len(lidar_points) < 4:
-            QMessageBox.warning(self, 'Calibration', 'Need at least 4 point pairs.')
+        n_points = len(image_points)
+        if n_points < 3 or len(lidar_points) < 3:
+            QMessageBox.warning(self, 'Calibration', 'Need at least 3 point pairs.')
             return
-        self.log('Running calibration...')
+        self.log('Running calibration (solvePnP, RANSAC, bundle adjustment)...')
         progress = self.show_progress("Running calibration...")
         try:
-            result, err = calibration_runner.run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs)
-        finally:
-            progress.close()
-        if result is None:
-            self.status_label.setText('Calibration failed.')
-            self.log(f'Calibration failed: {err}')
-            QMessageBox.warning(self, 'Calibration', f'Calibration failed: {err}')
-            self.last_projected_3d_points = None
-            self.display_image()
-        else:
-            self.status_label.setText(f'Calibration successful. Mean reprojection error: {result["mean_error"]:.2f} px')
-            self.log('Calibration successful!')
-            self.log(f'Rotation vector (rvec): {result["rvec"].flatten()}')
-            self.log(f'Translation vector (tvec): {result["tvec"].flatten()}')
-            self.log(f'Mean reprojection error: {result["mean_error"]:.2f} px')
-            self.log(f'Per-point errors: {result["errors"]}')
-            # Automatically save extrinsics to JSON
-            self.save_extrinsics_to_json(
-                result["rvec"],
-                result["tvec"],
-                result["mean_error"],
-                result.get("rotation_matrix", None)
-            )
-            # --- Store projected 3D->2D points for persistent overlay ---
+            # 1. Try direct solvePnP for 3+ points
+            solvepnp_result, solvepnp_err = calibration_runner.run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs)
+            if solvepnp_result is None:
+                self.status_label.setText('Calibration failed (solvePnP).')
+                self.log(f'Calibration failed (solvePnP): {solvepnp_err}')
+                QMessageBox.warning(self, 'Calibration', f'Calibration failed (solvePnP): {solvepnp_err}')
+                self.last_projected_3d_points = None
+                self.display_image()
+                return
+            self.log('solvePnP successful!')
+            self.log(f'Rotation vector (rvec): {solvepnp_result["rvec"].flatten()}')
+            self.log(f'Translation vector (tvec): {solvepnp_result["tvec"].flatten()}')
+            self.log(f'Mean reprojection error: {solvepnp_result["mean_error"]:.2f} px')
+            self.log(f'Per-point errors: {solvepnp_result["errors"]}')
+
+            # 2. Only run RANSAC if at least 10 points
+            if n_points >= 10:
+                ransac_result, ransac_err = calibration_runner.run_robust_calibration(image_points, lidar_points, camera_matrix, dist_coeffs)
+                if ransac_result is not None:
+                    inliers = ransac_result['inliers']
+                    res = ransac_result['result']
+                    self.log('RANSAC robust calibration successful!')
+                    self.log(f'Inliers: {np.sum(inliers)}/{len(inliers)}')
+                    self.log(f'Rotation vector (rvec): {res["rvec"].flatten()}')
+                    self.log(f'Translation vector (tvec): {res["tvec"].flatten()}')
+                    self.log(f'Mean reprojection error: {res["mean_error"]:.2f} px')
+                    self.log(f'Per-point errors: {res["errors"]}')
+                    # Highlight inliers (green) and outliers (red) in the point list
+                    for i in range(self.point_list.count()):
+                        item = self.point_list.item(i)
+                        if inliers[i]:
+                            item.setBackground(Qt.green)
+                            item.setForeground(Qt.black)
+                        else:
+                            item.setBackground(Qt.red)
+                            item.setForeground(Qt.white)
+                            self.log(f'Point {i}: OUTLIER')
+                    # 3. Bundle adjustment on inliers for final refinement
+                    inlier_img_pts = np.asarray(image_points)[inliers]
+                    inlier_lidar_pts = np.asarray(lidar_points)[inliers]
+                    ba_result, ba_err = calibration_runner.run_bundle_adjustment([inlier_img_pts], [inlier_lidar_pts], camera_matrix, dist_coeffs, rvec_init=res["rvec"], tvec_init=res["tvec"])
+                    if ba_result is not None:
+                        self.status_label.setText('Calibration successful (RANSAC + BA)!')
+                        self.log('Bundle adjustment successful!')
+                        self.log(f'Final Rotation vector (rvec): {ba_result["rvec"].flatten()}')
+                        self.log(f'Final Translation vector (tvec): {ba_result["tvec"].flatten()}')
+                        # Save extrinsics to JSON
+                        self.save_extrinsics_to_json(ba_result["rvec"], ba_result["tvec"], res["mean_error"])
+                        # Project 3D points for overlay
+                        try:
+                            proj_2d = calibration_runner.project_points(np.asarray(lidar_points, dtype=np.float32), ba_result["rvec"], ba_result["tvec"], camera_matrix, dist_coeffs)
+                            self.last_projected_3d_points = proj_2d
+                        except Exception as e:
+                            self.last_projected_3d_points = None
+                            self.log(f'Failed to compute projected 3D points: {e}')
+                        self.display_image()
+                        return
+                    else:
+                        self.status_label.setText('Calibration failed (Bundle Adjustment).')
+                        self.log(f'Bundle adjustment failed: {ba_err}')
+                        QMessageBox.warning(self, 'Calibration', f'Bundle adjustment failed: {ba_err}')
+                        self.last_projected_3d_points = None
+                        self.display_image()
+                        return
+                else:
+                    self.log('RANSAC failed, using solvePnP result.')
+            # For <10 points, or if RANSAC fails, use solvePnP result
+            self.status_label.setText('Calibration successful (solvePnP only)!')
+            self.save_extrinsics_to_json(solvepnp_result["rvec"], solvepnp_result["tvec"], solvepnp_result["mean_error"])
             try:
-                proj_2d = calibration_runner.project_points(np.asarray(lidar_points, dtype=np.float32), result["rvec"], result["tvec"], camera_matrix, dist_coeffs)
+                proj_2d = calibration_runner.project_points(np.asarray(lidar_points, dtype=np.float32), solvepnp_result["rvec"], solvepnp_result["tvec"], camera_matrix, dist_coeffs)
                 self.last_projected_3d_points = proj_2d
             except Exception as e:
                 self.last_projected_3d_points = None
                 self.log(f'Failed to compute projected 3D points: {e}')
             self.display_image()
+        finally:
+            try:
+                progress.close()
+            except Exception:
+                pass
 
     def export_points(self):
         try:
@@ -717,7 +804,7 @@ class CalibrationToolbox(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, 'Error', f'Failed to save intrinsics: {e}')
 
-    def analyze_outliers(self):
+    def analyse_outliers(self):
         # Outlier analysis using calibration_runner
         fx = self.CAMERA_INTRINSICS["fx"]
         fy = self.CAMERA_INTRINSICS["fy"]
@@ -728,7 +815,7 @@ class CalibrationToolbox(QMainWindow):
         dist_coeffs = dist.reshape(-1, 1)
         image_points = np.asarray(self.collected_image_points, dtype=np.float32)
         lidar_points = np.asarray(self.collected_lidar_points, dtype=np.float32)
-        progress = self.show_progress("Analyzing outliers...")
+        progress = self.show_progress("Analysing outliers...")
         try:
             result, err = calibration_runner.analyze_outliers(image_points, lidar_points, camera_matrix, dist_coeffs)
         finally:
@@ -750,7 +837,7 @@ class CalibrationToolbox(QMainWindow):
             self.log(f'Point {i}: error={err_val:.2f} px {status}')
         self.log(f'Mean error: {mean:.2f} px, Std: {std:.2f} px, Outlier threshold: {outlier_thresh:.2f} px')
 
-    def analyze_point_contributions(self):
+    def analyse_point_contributions(self):
         # Leave-one-out analysis using calibration_runner
         fx = self.CAMERA_INTRINSICS["fx"]
         fy = self.CAMERA_INTRINSICS["fy"]
@@ -761,7 +848,7 @@ class CalibrationToolbox(QMainWindow):
         dist_coeffs = dist.reshape(-1, 1)
         image_points = np.asarray(self.collected_image_points, dtype=np.float32)
         lidar_points = np.asarray(self.collected_lidar_points, dtype=np.float32)
-        progress = self.show_progress("Analyzing point contributions...")
+        progress = self.show_progress("Analysing point contributions...")
         try:
             contributions, err = calibration_runner.analyze_point_contributions(image_points, lidar_points, camera_matrix, dist_coeffs)
         finally:
@@ -776,7 +863,7 @@ class CalibrationToolbox(QMainWindow):
             else:
                 self.log(f"Point {c['index']}: calibration failed when removed. {c.get('error','')}")
 
-    def visualize_projections(self):
+    def visualise_projections(self):
         # Overlay projections on the image using current calibration
         if self.true_original_image is None:
             self.log('No image loaded.')
@@ -791,13 +878,13 @@ class CalibrationToolbox(QMainWindow):
         image_points = np.asarray(self.collected_image_points, dtype=np.float32)
         lidar_points = np.asarray(self.collected_lidar_points, dtype=np.float32)
         if len(image_points) < 4:
-            self.log('Need at least 4 points for projection visualization.')
+            self.log('Need at least 4 points for projection visualisation.')
             return
-        progress = self.show_progress("Visualizing projections...")
+            progress = self.show_progress("Visualising projections...")
         try:
             calib_result, err = calibration_runner.run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs)
             if calib_result is None:
-                self.log(f'Calibration required for visualization: {err}')
+                self.log(f'Calibration required for visualisation: {err}')
                 return
             proj_2d = calibration_runner.project_points(lidar_points, calib_result['rvec'], calib_result['tvec'], camera_matrix, dist_coeffs)
             # Draw on a copy of the image
@@ -812,7 +899,7 @@ class CalibrationToolbox(QMainWindow):
             cv2.destroyWindow('Projection Visualization (Green=Projected, Red=Clicked)')
         except Exception as e:
             QMessageBox.critical(self, 'Error', f'Failed to visualize projections: {e}')
-            self.log(f'Failed to visualize projections: {e}')
+            self.log(f'Failed to visualise projections: {e}')
         finally:
             progress.close()
 
@@ -821,75 +908,6 @@ class CalibrationToolbox(QMainWindow):
 
     def redo_action(self):
         self.pop_redo_state()
-
-    def run_robust_calibration(self):
-        fx = self.CAMERA_INTRINSICS["fx"]
-        fy = self.CAMERA_INTRINSICS["fy"]
-        cx = self.CAMERA_INTRINSICS["cx"]
-        cy = self.CAMERA_INTRINSICS["cy"]
-        dist = np.array(self.CAMERA_INTRINSICS["dist"][:5], dtype=np.float32)
-        camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
-        dist_coeffs = dist.reshape(-1, 1)
-        image_points = np.asarray(self.collected_image_points, dtype=np.float32)
-        lidar_points = np.asarray(self.collected_lidar_points, dtype=np.float32)
-        if len(image_points) < 4:
-            self.log('Need at least 4 points for robust calibration.')
-            return
-        progress = self.show_progress("Running robust calibration (RANSAC)...")
-        try:
-            result, err = calibration_runner.run_robust_calibration(image_points, lidar_points, camera_matrix, dist_coeffs)
-        finally:
-            progress.close()
-        if result is None:
-            self.log(f'Robust calibration failed: {err}')
-            QMessageBox.warning(self, 'Robust Calibration', f'Failed: {err}')
-            return
-        inliers = result['inliers']
-        res = result['result']
-        self.log('Robust calibration (RANSAC) successful!')
-        self.log(f'Inliers: {np.sum(inliers)}/{len(inliers)}')
-        self.log(f'Rotation vector (rvec): {res["rvec"].flatten()}')
-        self.log(f'Translation vector (tvec): {res["tvec"].flatten()}')
-        self.log(f'Mean reprojection error: {res["mean_error"]:.2f} px')
-        self.log(f'Per-point errors: {res["errors"]}')
-        # Highlight inliers (green) and outliers (red) in the point list
-        for i in range(self.point_list.count()):
-            item = self.point_list.item(i)
-            if inliers[i]:
-                item.setBackground(Qt.green)
-                item.setForeground(Qt.black)
-            else:
-                item.setBackground(Qt.red)
-                item.setForeground(Qt.white)
-                self.log(f'Point {i}: OUTLIER')
-
-    def run_bundle_adjustment(self):
-        # For now, use current points as a single view (multi-view support can be added)
-        fx = self.CAMERA_INTRINSICS["fx"]
-        fy = self.CAMERA_INTRINSICS["fy"]
-        cx = self.CAMERA_INTRINSICS["cx"]
-        cy = self.CAMERA_INTRINSICS["cy"]
-        dist = np.array(self.CAMERA_INTRINSICS["dist"][:5], dtype=np.float32)
-        camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
-        dist_coeffs = dist.reshape(-1, 1)
-        image_points = np.asarray(self.collected_image_points, dtype=np.float32)
-        lidar_points = np.asarray(self.collected_lidar_points, dtype=np.float32)
-        if len(image_points) < 4:
-            self.log('Need at least 4 points for bundle adjustment.')
-            return
-        progress = self.show_progress("Running bundle adjustment...")
-        try:
-            result, err = calibration_runner.run_bundle_adjustment([image_points], [lidar_points], camera_matrix, dist_coeffs)
-        finally:
-            progress.close()
-        if result is None:
-            self.log(f'Bundle adjustment failed: {err}')
-            QMessageBox.warning(self, 'Bundle Adjustment', f'Failed: {err}')
-            return
-        self.log('Bundle adjustment successful!')
-        self.log(f'Rotation vector (rvec): {result["rvec"].flatten()}')
-        self.log(f'Translation vector (tvec): {result["tvec"].flatten()}')
-        self.log(f'Success: {result["success"]}')
 
     def load_pcd_file(self):
         progress = self.show_progress("Loading PCD file...")

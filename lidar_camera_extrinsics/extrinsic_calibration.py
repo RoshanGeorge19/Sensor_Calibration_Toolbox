@@ -1,9 +1,31 @@
+
+
+# =============================================================================
+# LIDAR-Camera Calibration Tool - Extrinsic Calibration Module
+# -----------------------------------------------------------------------------
+# Description: Core calibration logic for LIDAR-camera extrinsic parameter estimation.
+# Author: Roshan George, Dara Molloy
+# Date: 30-06-2025
+# License: MIT
+# =============================================================================
+
 import numpy as np
 import cv2
 from scipy.optimize import minimize, least_squares
 import logging
 
 def project_3d_to_2d(LIDAR_3D_PTS, camera_matrix_input, dist_coeffs_input, rvec, tvec):
+    """
+    Projects 3D LIDAR points to 2D image points using camera intrinsics and extrinsics.
+    Args:
+        LIDAR_3D_PTS (np.ndarray): Nx3 array of 3D points.
+        camera_matrix_input (np.ndarray): 3x3 camera intrinsic matrix.
+        dist_coeffs_input (np.ndarray): Distortion coefficients.
+        rvec (np.ndarray): Rotation vector (3x1).
+        tvec (np.ndarray): Translation vector (3x1).
+    Returns:
+        np.ndarray: Nx2 array of projected 2D points.
+    """
     rvec = np.asarray(rvec, dtype=np.float32)
     tvec = np.asarray(tvec, dtype=np.float32)
     points_2d, _ = cv2.projectPoints(LIDAR_3D_PTS, rvec, tvec, camera_matrix_input, dist_coeffs_input)
@@ -11,9 +33,14 @@ def project_3d_to_2d(LIDAR_3D_PTS, camera_matrix_input, dist_coeffs_input, rvec,
     return points_2d
 
 def robust_objective_function(params, LIDAR_3D_PTS, IMAGE_2D_PTS, camera_matrix_input, dist_coeffs_input):
+    """
+    Objective function for robust optimization (minimizes reprojection error).
+    Penalizes out-of-bounds or invalid parameter values.
+    """
     try:
         rvec_opt = params[:3].reshape(3, 1)
         tvec_opt = params[3:].reshape(3, 1)
+        # Reject extreme/unrealistic values
         if np.any(np.abs(rvec_opt) > 2 * np.pi):
             return 1e10
         if np.any(np.abs(tvec_opt) > 1000):
@@ -29,6 +56,18 @@ def robust_objective_function(params, LIDAR_3D_PTS, IMAGE_2D_PTS, camera_matrix_
         return 1e10
 
 def run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs):
+    """
+    Runs extrinsic calibration using 2D-3D correspondences.
+    Uses OpenCV's solvePnP for initial estimate, then refines with robust optimization.
+    Args:
+        image_points (np.ndarray): Nx2 array of 2D image points.
+        lidar_points (np.ndarray): Nx3 array of 3D LIDAR points.
+        camera_matrix (np.ndarray): 3x3 camera intrinsic matrix.
+        dist_coeffs (np.ndarray): Distortion coefficients.
+    Returns:
+        dict: Calibration result (rotation, translation, errors, etc.)
+        str: Error message if failed, else None.
+    """
     image_points = np.asarray(image_points, dtype=np.float32)
     lidar_points = np.asarray(lidar_points, dtype=np.float32)
     n = len(image_points)
@@ -54,6 +93,7 @@ def run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs):
     initial_proj_2d = project_3d_to_2d(lidar_points, camera_matrix, dist_coeffs, rvec, tvec)
     initial_errors = np.linalg.norm(image_points - initial_proj_2d, axis=1)
     logging.info(f'Initial mean reprojection error: {np.mean(initial_errors):.4f}, max error: {np.max(initial_errors):.4f}')
+    # Local optimization (L-BFGS-B) to refine pose
     result = minimize(
         robust_objective_function,
         initial_params,
@@ -62,7 +102,7 @@ def run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs):
         options={'ftol': 1e-9, 'maxiter': 10000, 'disp': False}
     )
     if not result.success:
-        logging.warning(f'Optimisation failed: {result.message}. Returning initial pose from solvePnP.')
+        logging.info(f'Optimisation failed: {result.message}. Returning initial pose from solvePnP.')
         # Fallback: return initial pose from solvePnP
         proj_2d = initial_proj_2d
         errors = initial_errors
@@ -78,6 +118,7 @@ def run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs):
             'fallback': True,
             'message': f'Optimisation failed: {result.message}'
         }, 'Optimisation failed, returned initial pose from solvePnP.'
+    # Use optimized pose
     opt_params = result.x
     rvec_opt = opt_params[:3].reshape(3, 1)
     tvec_opt = opt_params[3:].reshape(3, 1)
@@ -98,7 +139,8 @@ def run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs):
 
 def analyze_outliers(image_points, lidar_points, camera_matrix, dist_coeffs):
     """
-    Returns a dict with per-point errors, mean, std, and outlier threshold.
+    Analyze per-point reprojection errors and identify outliers.
+    Returns a dict with errors, mean, std, and outlier threshold (mean + 2*std).
     """
     image_points = np.asarray(image_points, dtype=np.float32)
     lidar_points = np.asarray(lidar_points, dtype=np.float32)
@@ -120,7 +162,8 @@ def analyze_outliers(image_points, lidar_points, camera_matrix, dist_coeffs):
 
 def analyze_point_contributions(image_points, lidar_points, camera_matrix, dist_coeffs):
     """
-    Returns a list of dicts: for each point, the mean error when that point is left out, and the delta from the base error.
+    For each point, computes the mean error when that point is left out (leave-one-out analysis).
+    Returns a list of dicts: index, mean_error, delta from base error, and success flag.
     """
     image_points = np.asarray(image_points, dtype=np.float32)
     lidar_points = np.asarray(lidar_points, dtype=np.float32)
@@ -147,11 +190,20 @@ def analyze_point_contributions(image_points, lidar_points, camera_matrix, dist_
 def project_points(lidar_points, rvec, tvec, camera_matrix, dist_coeffs):
     """
     Projects 3D points to 2D using given extrinsics and intrinsics.
+    Wrapper for project_3d_to_2d.
     """
     return project_3d_to_2d(lidar_points, camera_matrix, dist_coeffs, rvec, tvec)
 
 # --- Advanced Calibration Features ---
 def huber_loss(residuals, delta=1.0):
+    """
+    Huber loss function for robust error penalization.
+    Args:
+        residuals (np.ndarray): Residual errors.
+        delta (float): Huber threshold.
+    Returns:
+        np.ndarray: Loss values.
+    """
     abs_r = np.abs(residuals)
     mask = abs_r <= delta
     out = np.empty_like(residuals)
@@ -161,7 +213,19 @@ def huber_loss(residuals, delta=1.0):
 
 def run_robust_calibration(image_points, lidar_points, camera_matrix, dist_coeffs, loss='huber', ransac_thresh=8.0, ransac_trials=100):
     """
-    RANSAC-based robust calibration. Returns best inlier set and calibration result.
+    RANSAC-based robust calibration. Randomly samples minimal sets, fits models, and selects the best inlier set.
+    Returns best inlier set and calibration result.
+    Args:
+        image_points (np.ndarray): Nx2 array of 2D image points.
+        lidar_points (np.ndarray): Nx3 array of 3D LIDAR points.
+        camera_matrix (np.ndarray): 3x3 camera intrinsic matrix.
+        dist_coeffs (np.ndarray): Distortion coefficients.
+        loss (str): Loss function (currently unused).
+        ransac_thresh (float): Inlier threshold (pixels).
+        ransac_trials (int): Number of RANSAC iterations.
+    Returns:
+        dict: {'result': calibration result, 'inliers': inlier mask}
+        str: Error message if failed, else None.
     """
     image_points = np.asarray(image_points, dtype=np.float32)
     lidar_points = np.asarray(lidar_points, dtype=np.float32)
@@ -192,14 +256,25 @@ def run_robust_calibration(image_points, lidar_points, camera_matrix, dist_coeff
 
 def run_bundle_adjustment(image_points_list, lidar_points_list, camera_matrix, dist_coeffs, rvec_init=None, tvec_init=None):
     """
-    Bundle adjustment for multiple views (lists of image/3d points). Returns optimized rvec, tvec.
+    Bundle adjustment for multiple views (lists of image/3d points).
+    Optimizes extrinsics over all views jointly.
+    Args:
+        image_points_list (list): List of Nx2 arrays of 2D image points.
+        lidar_points_list (list): List of Nx3 arrays of 3D LIDAR points.
+        camera_matrix (np.ndarray): 3x3 camera intrinsic matrix.
+        dist_coeffs (np.ndarray): Distortion coefficients.
+        rvec_init (np.ndarray): Optional initial rotation vector.
+        tvec_init (np.ndarray): Optional initial translation vector.
+    Returns:
+        dict: {'rvec': rvec_opt, 'tvec': tvec_opt, 'success': True}
+        str: Error message if failed, else None.
     """
     # image_points_list, lidar_points_list: list of arrays, one per view
     if not (isinstance(image_points_list, list) and isinstance(lidar_points_list, list)):
         return None, 'Input must be lists of arrays.'
     if len(image_points_list) < 1:
         return None, 'Need at least one view.'
-    # Stack all points
+    # Stack all points for joint optimization
     img_pts = np.vstack(image_points_list)
     lidar_pts = np.vstack(lidar_points_list)
     if rvec_init is None or tvec_init is None:
@@ -218,7 +293,5 @@ def run_bundle_adjustment(image_points_list, lidar_points_list, camera_matrix, d
     if not result.success:
         return None, 'Bundle adjustment failed.'
     rvec_opt = result.x[:3].reshape(3,1)
-    tvec_opt = result.x[3:].reshape(3,1)
-    return {'rvec': rvec_opt, 'tvec': tvec_opt, 'success': True}, None
     tvec_opt = result.x[3:].reshape(3,1)
     return {'rvec': rvec_opt, 'tvec': tvec_opt, 'success': True}, None
