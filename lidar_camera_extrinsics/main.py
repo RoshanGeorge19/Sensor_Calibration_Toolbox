@@ -18,7 +18,7 @@ Features:
 import sys
 import numpy as np
 import cv2
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QWidget, QFileDialog, QListWidget, QLineEdit, QMessageBox, QTextEdit, QTabWidget, QFormLayout, QComboBox, QProgressDialog, QAction, QMenuBar, QMenu, QInputDialog)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QWidget, QFileDialog, QListWidget, QLineEdit, QMessageBox, QTextEdit, QTabWidget, QFormLayout, QComboBox, QProgressDialog, QAction, QMenuBar, QMenu, QInputDialog, QSizePolicy)
 from PyQt5.QtGui import QPixmap, QImage, QMouseEvent
 from PyQt5.QtCore import Qt, QPoint
 import extrinsic_calibration as calibration_runner
@@ -298,14 +298,60 @@ class CalibrationToolbox(QMainWindow):
         # Removed Robust Calibration and Bundle Adjustment buttons
 
         # --- Move PCD validation controls to Calibration tab ---
-        self.load_pcd_btn = QPushButton('Load PCD')
-        self.load_pcd_btn.clicked.connect(self.load_pcd_file)
-        control_layout.addWidget(self.load_pcd_btn)
-        self.project_pcd_btn = QPushButton('Project PCD onto Image')
-        self.project_pcd_btn.clicked.connect(self.project_pcd_onto_image)
-        control_layout.addWidget(self.project_pcd_btn)
+        # Combined Load & Project PCD button
+        self.pcd_overlay_enabled = False
+        self.pcd_btn = QPushButton('Load and Project PCD')
+        self.pcd_btn.clicked.connect(self.load_and_project_pcd)
+        control_layout.addWidget(self.pcd_btn)
+        # Toggle overlay button
+        self.toggle_pcd_btn = QPushButton('Toggle PCD Overlay')
+        self.toggle_pcd_btn.setCheckable(True)
+        self.toggle_pcd_btn.setChecked(False)
+        self.toggle_pcd_btn.clicked.connect(self.toggle_pcd_overlay)
+        control_layout.addWidget(self.toggle_pcd_btn)
         self.loaded_pcd_points = None
+        self.loaded_pcd_intensities = None
+        self.pcd_overlay_pixmap = None
         self.last_extrinsics = None
+    def load_and_project_pcd(self):
+        """
+        Loads a PCD file and projects it onto the image, displaying the overlay if enabled.
+        """
+        fname, _ = QFileDialog.getOpenFileName(self, 'Load PCD', '', 'PCD files (*.pcd)')
+        if not fname:
+            return
+        progress = self.show_progress("Loading and projecting PCD...")
+        try:
+            # Try Open3D if available, else fallback to simple parser
+            try:
+                import open3d as o3d
+                pcd = o3d.io.read_point_cloud(fname)
+                points = np.asarray(pcd.points)
+                if hasattr(pcd, 'intensities') and len(pcd.intensities) == len(points):
+                    intensities = np.asarray(pcd.intensities)
+                else:
+                    intensities = None
+            except ImportError:
+                points, intensities = self.simple_pcd_loader(fname)
+                if intensities is not None and np.all(intensities == 1.0):
+                    intensities = None
+            self.loaded_pcd_points = points
+            self.loaded_pcd_intensities = intensities
+            self.log(f'Loaded PCD: {fname} ({points.shape[0]} points)')
+            # Project immediately if image and extrinsics are available
+            if self.true_original_image is not None:
+                self.project_pcd_onto_image(show_overlay=True)
+        except Exception as e:
+            self.log(f'Failed to load or project PCD: {e}')
+        finally:
+            progress.close()
+
+    def toggle_pcd_overlay(self):
+        """
+        Toggle the display of the PCD overlay on the image.
+        """
+        self.pcd_overlay_enabled = not self.pcd_overlay_enabled
+        self.display_image()
         # Remove Validation tab (do not add it)
 
     def log(self, msg):
@@ -341,6 +387,18 @@ class CalibrationToolbox(QMainWindow):
             if img is None:
                 raise Exception('Could not load image.')
             self.true_original_image = img
+            # --- Set label size to match image aspect ratio, max 1280x720 ---
+            h, w = img.shape[:2]
+            max_w, max_h = 1280, 720
+            aspect = w / h
+            if w > max_w or h > max_h:
+                # Scale down to fit max size
+                scale = min(max_w / w, max_h / h)
+                disp_w = int(w * scale)
+                disp_h = int(h * scale)
+            else:
+                disp_w, disp_h = w, h
+            self.image_label.setFixedSize(disp_w, disp_h)
             self._zoom_initialized = False
             self.display_image(fit_to_canvas=True)
             self.status_label.setText('Image loaded. Click to select points.')
@@ -376,20 +434,73 @@ class CalibrationToolbox(QMainWindow):
         y_off = self.pan_offset.y()
         x_off = max(0, min(x_off, max(0, zoomed_w - disp_w)))
         y_off = max(0, min(y_off, max(0, zoomed_h - disp_h)))
+        # Center the image in the label if it's smaller than the label
+        x_pad = max(0, (disp_w - zoomed_w) // 2)
+        y_pad = max(0, (disp_h - zoomed_h) // 2)
         img_cropped = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
-        crop = img[y_off:y_off+disp_h, x_off:x_off+disp_w]
-        img_cropped[:crop.shape[0], :crop.shape[1]] = crop
+        crop = img[y_off:y_off+min(zoomed_h, disp_h), x_off:x_off+min(zoomed_w, disp_w)]
+        ch, cw = crop.shape[:2]
+        img_cropped[y_pad:y_pad+ch, x_pad:x_pad+cw] = crop
+        # Adjust all drawing coordinates by x_pad, y_pad below
+
+        # --- Draw PCD overlay if enabled ---
+        if self.pcd_overlay_enabled and self.loaded_pcd_points is not None and self.last_extrinsics is not None:
+            try:
+                # Use rotation matrix and tvec from extrinsics_result.json
+                rot_matrix = np.array(self.last_extrinsics['rotation_matrix'], dtype=np.float32)
+                tvec = np.array(self.last_extrinsics['tvec'], dtype=np.float32).reshape(3,1)
+                fx = self.CAMERA_INTRINSICS["fx"]
+                fy = self.CAMERA_INTRINSICS["fy"]
+                cx = self.CAMERA_INTRINSICS["cx"]
+                cy = self.CAMERA_INTRINSICS["cy"]
+                dist = np.array(self.CAMERA_INTRINSICS["dist"][:5], dtype=np.float32)
+                camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+                dist_coeffs = dist.reshape(-1, 1)
+                # Transform points using rotation matrix and tvec
+                points = self.loaded_pcd_points
+                # Apply rotation and translation: X_cam = R * X_lidar + t
+                points_cam = (rot_matrix @ points.T).T + tvec.flatten()
+                # Project to 2D
+                proj_2d, _ = cv2.projectPoints(points_cam, np.zeros((3,1), dtype=np.float32), np.zeros((3,1), dtype=np.float32), camera_matrix, dist_coeffs)
+                proj_2d = proj_2d.reshape(-1, 2)
+                intensities = self.loaded_pcd_intensities
+                zoom = self.zoom
+                # Draw projected PCD points directly on img_cropped
+                if intensities is not None:
+                    int_min = intensities.min()
+                    int_ptp = np.ptp(intensities) if len(intensities) > 0 else 1.0
+                    norm_int = (intensities - int_min) / (int_ptp + 1e-6)
+                    for pt, inten in zip(proj_2d, norm_int):
+                        if not np.isfinite(pt[0]) or not np.isfinite(pt[1]):
+                            continue
+                        x_proj = int(pt[0] * zoom - x_off + x_pad)
+                        y_proj = int(pt[1] * zoom - y_off + y_pad)
+                        if 0 <= x_proj < disp_w and 0 <= y_proj < disp_h:
+                            color = (0, int(255*inten), int(255*inten))  # BGR: black to yellow
+                            cv2.circle(img_cropped, (x_proj, y_proj), 1, color, -1)
+                else:
+                    light_yellow = (0, 255, 255)  # BGR
+                    for pt in proj_2d:
+                        if not np.isfinite(pt[0]) or not np.isfinite(pt[1]):
+                            continue
+                        x_proj = int(pt[0] * zoom - x_off + x_pad)
+                        y_proj = int(pt[1] * zoom - y_off + y_pad)
+                        if 0 <= x_proj < disp_w and 0 <= y_proj < disp_h:
+                            cv2.circle(img_cropped, (x_proj, y_proj), 1, light_yellow, -1)
+            except Exception as e:
+                self.log(f'Failed to draw PCD overlay: {e}')
+
         # --- Draw 2D points (orange) and projected 3D points (cyan), green if overlap ---
         circle_radius = 8
         circle_thickness = 2
         orange = (0, 165, 255)  # BGR for orange
         cyan = (255, 255, 0)    # BGR for cyan
         green = (0, 255, 0)     # BGR for green (overlap)
-        # Compute display positions
-        pts_2d_disp = [(int(pt[0] * self.zoom - x_off), int(pt[1] * self.zoom - y_off)) for pt in self.collected_image_points]
+        # Compute display positions (add x_pad, y_pad)
+        pts_2d_disp = [(int(pt[0] * self.zoom - x_off + x_pad), int(pt[1] * self.zoom - y_off + y_pad)) for pt in self.collected_image_points]
         pts_3d_disp = []
         if self.last_projected_3d_points is not None:
-            pts_3d_disp = [(int(pt[0] * self.zoom - x_off), int(pt[1] * self.zoom - y_off)) for pt in self.last_projected_3d_points]
+            pts_3d_disp = [(int(pt[0] * self.zoom - x_off + x_pad), int(pt[1] * self.zoom - y_off + y_pad)) for pt in self.last_projected_3d_points]
         # Draw green where overlap, else orange/cyan
         drawn_3d = set()
         for i, pt2d in enumerate(pts_2d_disp):
@@ -413,18 +524,18 @@ class CalibrationToolbox(QMainWindow):
         # Draw temp point (if not already in the list)
         if hasattr(self, 'temp_clicked_2d_point') and self.temp_clicked_2d_point is not None:
             if self.temp_clicked_2d_point not in self.collected_image_points:
-                x_disp = int(self.temp_clicked_2d_point[0] * self.zoom - x_off)
-                y_disp = int(self.temp_clicked_2d_point[1] * self.zoom - y_off)
+                x_disp = int(self.temp_clicked_2d_point[0] * self.zoom - x_off + x_pad)
+                y_disp = int(self.temp_clicked_2d_point[1] * self.zoom - y_off + y_pad)
                 if 0 <= x_disp < disp_w and 0 <= y_disp < disp_h:
                     cv2.circle(img_cropped, (x_disp, y_disp), circle_radius, orange, circle_thickness)
-        # --- Draw color legend in bottom-left corner ---
+        # --- Draw color legend in bottom-left corner (relative to image area) ---
         legend_items = [
             (orange, '2D Point'),
             (cyan,   '3D Projected'),
             (green,  'Overlap'),
         ]
-        legend_x = 15
-        legend_y = disp_h - 20 * len(legend_items) - 15
+        legend_x = x_pad + 15
+        legend_y = y_pad + (zoomed_h if zoomed_h + y_pad < disp_h else disp_h) - 20 * len(legend_items) - 15
         box_w = 140
         box_h = 20 * len(legend_items) + 10
         # Draw background box (semi-transparent)
@@ -880,8 +991,9 @@ class CalibrationToolbox(QMainWindow):
         if len(image_points) < 4:
             self.log('Need at least 4 points for projection visualisation.')
             return
-            progress = self.show_progress("Visualising projections...")
+        progress = None
         try:
+            progress = self.show_progress("Visualising projections...")
             calib_result, err = calibration_runner.run_calibration(image_points, lidar_points, camera_matrix, dist_coeffs)
             if calib_result is None:
                 self.log(f'Calibration required for visualisation: {err}')
@@ -901,7 +1013,8 @@ class CalibrationToolbox(QMainWindow):
             QMessageBox.critical(self, 'Error', f'Failed to visualize projections: {e}')
             self.log(f'Failed to visualise projections: {e}')
         finally:
-            progress.close()
+            if progress is not None:
+                progress.close()
 
     def undo_action(self):
         self.pop_undo_state()
@@ -962,126 +1075,30 @@ class CalibrationToolbox(QMainWindow):
                         continue
         return np.array(points, dtype=np.float32), np.array(intensities, dtype=np.float32)
 
-    def project_pcd_onto_image(self):
-        progress = self.show_progress("Projecting PCD onto image...")
+    def project_pcd_onto_image(self, show_overlay=False):
+        """
+        Projects loaded PCD onto the image using the last extrinsics and updates overlay state.
+        If show_overlay is True, enables overlay display.
+        """
+        if self.true_original_image is None:
+            self.log('No image loaded.')
+            return
+        if self.loaded_pcd_points is None:
+            self.log('No PCD loaded.')
+            return
+        # Load extrinsics from last calibration JSON
+        extr_file = 'extrinsics_result.json'
         try:
-            if self.true_original_image is None:
-                self.log('No image loaded.')
-                progress.close()
-                return
-            if self.loaded_pcd_points is None:
-                self.log('No PCD loaded.')
-                progress.close()
-                return
-            intensities = getattr(self, 'loaded_pcd_intensities', None)
-            if intensities is not None and len(intensities) != len(self.loaded_pcd_points):
-                intensities = None
-            # Load extrinsics from last calibration JSON
-            extr_file = 'extrinsics_result.json'
-            try:
-                with open(extr_file, 'r') as f:
-                    extr = json.load(f)
-                rvec = np.array(extr['rvec'], dtype=np.float32).reshape(3,1)
-                tvec = np.array(extr['tvec'], dtype=np.float32).reshape(3,1)
-            except Exception as e:
-                self.log(f'Failed to load extrinsics: {e}')
-                progress.close()
-                return
-            # Camera intrinsics
-            fx = self.CAMERA_INTRINSICS["fx"]
-            fy = self.CAMERA_INTRINSICS["fy"]
-            cx = self.CAMERA_INTRINSICS["cx"]
-            cy = self.CAMERA_INTRINSICS["cy"]
-            dist = np.array(self.CAMERA_INTRINSICS["dist"][:5], dtype=np.float32)
-            camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
-            dist_coeffs = dist.reshape(-1, 1)
-            try:
-                import extrinsic_calibration as calibration_runner
-                # Log a few PCD points and calibration 3D points for debugging
-                if self.loaded_pcd_points is not None and len(self.loaded_pcd_points) > 0:
-                    self.log(f'First 3 PCD points: {self.loaded_pcd_points[:3]}')
-                    self.log(f'PCD X range: {np.min(self.loaded_pcd_points[:,0]):.2f} to {np.max(self.loaded_pcd_points[:,0]):.2f}')
-                    self.log(f'PCD Y range: {np.min(self.loaded_pcd_points[:,1]):.2f} to {np.max(self.loaded_pcd_points[:,1]):.2f}')
-                    self.log(f'PCD Z range: {np.min(self.loaded_pcd_points[:,2]):.2f} to {np.max(self.loaded_pcd_points[:,2]):.2f}')
-                if self.collected_lidar_points is not None and len(self.collected_lidar_points) > 0:
-                    arr = np.array(self.collected_lidar_points)
-                    self.log(f'First 3 calibration 3D points: {self.collected_lidar_points[:3]}')
-                    self.log(f'Calib X range: {np.min(arr[:,0]):.2f} to {np.max(arr[:,0]):.2f}')
-                    self.log(f'Calib Y range: {np.min(arr[:,1]):.2f} to {np.max(arr[:,1]):.2f}')
-                    self.log(f'Calib Z range: {np.min(arr[:,2]):.2f} to {np.max(arr[:,2]):.2f}')
-                proj_2d = calibration_runner.project_points(self.loaded_pcd_points, rvec, tvec, camera_matrix, dist_coeffs)
-                # --- Draw directly on the displayed (zoomed/cropped) image for perfect alignment ---
-                img = self.true_original_image.copy()
-                h, w, _ = img.shape
-                disp_w, disp_h = self.image_label.width(), self.image_label.height()
-                # Compute zoom and pan as in display_image
-                zoom = self.zoom
-                x_off = self.pan_offset.x()
-                y_off = self.pan_offset.y()
-                zoomed_w, zoomed_h = int(w * zoom), int(h * zoom)
-                img_zoomed = cv2.resize(img, (zoomed_w, zoomed_h), interpolation=cv2.INTER_LINEAR)
-                # Crop to display area
-                img_cropped = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
-                crop = img_zoomed[y_off:y_off+disp_h, x_off:x_off+disp_w]
-                img_cropped[:crop.shape[0], :crop.shape[1]] = crop
-                # Draw projected PCD points directly on img_cropped
-                if intensities is not None:
-                    # Use np.ptp for compatibility with NumPy 2.0+
-                    int_min = intensities.min()
-                    int_ptp = np.ptp(intensities) if len(intensities) > 0 else 1.0
-                    norm_int = (intensities - int_min) / (int_ptp + 1e-6)
-                    for pt, inten in zip(proj_2d, norm_int):
-                        # Skip points with NaN or inf
-                        if not np.isfinite(pt[0]) or not np.isfinite(pt[1]):
-                            continue
-                        x_proj = int(pt[0] * zoom - x_off)
-                        y_proj = int(pt[1] * zoom - y_off)
-                        if 0 <= x_proj < disp_w and 0 <= y_proj < disp_h:
-                            # Map intensity to color (grayscale: 0=black, 1=yellow)
-                            color = (0, int(255*inten), int(255*inten))  # BGR: black to yellow
-                            cv2.circle(img_cropped, (x_proj, y_proj), 1, color, -1)
-                else:
-                    # No intensities: use light yellow for all points
-                    light_yellow = (0, 255, 255)  # BGR
-                    for pt in proj_2d:
-                        # Skip points with NaN or inf
-                        if not np.isfinite(pt[0]) or not np.isfinite(pt[1]):
-                            continue
-                        x_proj = int(pt[0] * zoom - x_off)
-                        y_proj = int(pt[1] * zoom - y_off)
-                        if 0 <= x_proj < disp_w and 0 <= y_proj < disp_h:
-                            cv2.circle(img_cropped, (x_proj, y_proj), 1, light_yellow, -1)
-                # Draw color legend in bottom-left corner (reuse from display_image)
-                circle_radius = 8
-                orange = (0, 165, 255)
-                cyan = (255, 255, 0)
-                green = (0, 255, 0)
-                legend_items = [
-                    (orange, '2D Point'),
-                    (cyan,   '3D Projected'),
-                    (green,  'Overlap'),
-                ]
-                legend_x = 15
-                legend_y = disp_h - 20 * len(legend_items) - 15
-                box_w = 140
-                box_h = 20 * len(legend_items) + 10
-                overlay = img_cropped.copy()
-                cv2.rectangle(overlay, (legend_x-5, legend_y-10), (legend_x+box_w, legend_y+box_h), (30,30,30), -1)
-                alpha = 0.6
-                img_cropped = cv2.addWeighted(overlay, alpha, img_cropped, 1-alpha, 0)
-                for i, (color, label) in enumerate(legend_items):
-                    cy = legend_y + 20*i + 10
-                    cv2.circle(img_cropped, (legend_x+10, cy), 7, color, -1)
-                    cv2.putText(img_cropped, label, (legend_x+25, cy+5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
-                rgb = cv2.cvtColor(img_cropped, cv2.COLOR_BGR2RGB)
-                qimg = QImage(rgb.data, disp_w, disp_h, disp_w*3, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(qimg)
-                self.image_label.setPixmap(pixmap)
-                self.log(f'Projected {len(proj_2d)} PCD points onto image in GUI.')
-            except Exception as e:
-                self.log(f'Projection failed: {e}')
-        finally:
-            progress.close()
+            with open(extr_file, 'r') as f:
+                extr = json.load(f)
+            self.last_extrinsics = extr
+        except Exception as e:
+            self.log(f'Failed to load extrinsics: {e}')
+            return
+        if show_overlay:
+            self.pcd_overlay_enabled = True
+            self.toggle_pcd_btn.setChecked(True)
+        self.display_image()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
